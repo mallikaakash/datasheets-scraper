@@ -61,24 +61,92 @@ async def run_phase2(category, concurrency=30, start=None, end=None):
     existing = set()
     for fpath in Path(output_dir).glob("*.html"):
         if fpath.stat().st_size > 5000:
-            existing.add(fpath.name)  # use full filename with extension
+            existing.add(fpath.name)
 
-    todo = []
+    # Filter to only valid category URLs
+    valid_items = []
+    skipped_malformed = 0
     for it in items:
         url = it["url"]
-        # Skip malformed/relative URLs
-        if not url.startswith('https://'):
-            print(f"[phase2] SKIP bad URL: {url[:80]}")
+        if not url.startswith('https://www.datasheets.com/category/'):
+            skipped_malformed += 1
+            continue
+        # Skip URLs with clearly malformed subcategory slugs (truncated at hyphen boundary)
+        # e.g. "discrete-" (should be "discrete-semiconductors")
+        try:
+            subcat_slug = url.split(f"/category/{category}/")[1].split("/")[0].split("?")[0]
+            if subcat_slug.endswith('-'):
+                skipped_malformed += 1
+                continue
+        except (IndexError, ValueError):
+            skipped_malformed += 1
             continue
         if safe_filename(url) not in existing:
-            todo.append(it)
+            valid_items.append(it)
+
+    if skipped_malformed:
+        print(f"[phase2] SKIPPED {skipped_malformed} malformed URLs")
 
     range_label = f"[{start or 1}-{end or len(items)}]"
-    print(f"[phase2] [{category}] {range_label} Total: {len(items)} | Already on disk: {len(existing)} | To fetch: {len(todo)}")
-    if not todo:
+    print(f"[phase2] [{category}] {range_label} Total items: {len(items)} | Already on disk: {len(existing)} | To fetch: {len(valid_items)}")
+
+    if not valid_items:
+        print(f"[phase2] [{category}] Nothing to fetch.")
         return
 
+    # Group URLs by subcategory — subcategory is the first path segment after {category}/
+    # e.g. https://www.datasheets.com/category/semiconductors/discrete-semiconductors
+    # subcategory = "discrete-semiconductors"
+    subcats: dict[str, list[dict]] = {}
+    for it in valid_items:
+        url = it["url"]
+        parts = url.split(f"/category/{category}/")[1].split("/")[0].split("?")[0]
+        subcats.setdefault(parts, []).append(it)
+
+    print(f"[phase2] [{category}] {len(subcats)} subcategories to probe")
+
+    # Circuit breaker: probe each subcategory. Skip entire subcategory if probe fails.
+    # Probe uses the first URL in the subcategory.
     semaphore = asyncio.Semaphore(concurrency)
+    skipped_subcats: set[str] = set()
+
+    async def probe_subcat(subcat, subcat_items):
+        async with semaphore:
+            probe_url = subcat_items[0]["url"]
+            resp = await fetch_with_retry(probe_url)
+            if resp is None or resp.status_code >= 500:
+                return subcat, False
+            return subcat, True
+
+    # Run probes in waves to avoid triggering rate limits
+    subcat_list = list(subcats.items())
+    probed_ok = set()
+    wave_size = min(concurrency * 2, len(subcat_list))
+
+    for wave_start in range(0, len(subcat_list), wave_size):
+        wave = subcat_list[wave_start:wave_start + wave_size]
+        wave_results = await asyncio.gather(*[probe_subcat(sc, items) for sc, items in wave])
+        for subcat, ok in wave_results:
+            if ok:
+                probed_ok.add(subcat)
+            else:
+                skipped_subcats.add(subcat)
+                skipped_count = len(subcats[subcat])
+                print(f"[phase2] SKIP subcategory (blocked): {subcat} ({skipped_count} URLs)")
+        if wave_start + wave_size < len(subcat_list):
+            await asyncio.sleep(1.0)  # brief pause between probe waves
+
+    # Build final todo: only URLs from working subcategories
+    todo = []
+    for subcat, subcat_items in subcats.items():
+        if subcat not in skipped_subcats:
+            todo.extend(subcat_items)
+
+    print(f"[phase2] [{category}] Probing done. {len(todo)} URLs from {len(probed_ok)} subcategories | {len(skipped_subcats)} subcategories blocked")
+
+    if not todo:
+        print(f"[phase2] [{category}] All subcategories blocked. Nothing to fetch.")
+        return
 
     async def fetch_one(item):
         async with semaphore:
@@ -90,7 +158,7 @@ async def run_phase2(category, concurrency=30, start=None, end=None):
             return item["url"], None, f"status={resp.status_code} size={len(resp.content)}"
 
     saved = errors = 0
-    batch_size = concurrency * 2  # smaller batches to avoid triggering rate limits
+    batch_size = concurrency * 2
 
     for i in range(0, len(todo), batch_size):
         batch = todo[i:i + batch_size]
@@ -114,7 +182,7 @@ async def run_phase2(category, concurrency=30, start=None, end=None):
               f"saved:{saved} err:{errors} ({i + len(batch)}/{len(todo)}, ~{elapsed:.0f}s)")
 
         if i + batch_size < len(todo):
-            await asyncio.sleep(2.0)  # pause between batches to avoid rate limits
+            await asyncio.sleep(2.0)
 
     total = len(list(Path(output_dir).glob("*.html")))
     print(f"[phase2] [{category}] Done — saved:{saved} err:{errors}, {total} files on disk")
