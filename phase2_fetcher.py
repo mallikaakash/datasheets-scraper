@@ -1,5 +1,5 @@
 """
-Phase 2: Fast HTML Fetcher using curl_cffi (Chrome TLS impersonation).
+Phase 2: HTML Fetcher using curl_cffi (TLS fingerprint; matches phase 1).
 Reads listing URLs from data/urls/listing_urls_{category}.jsonl,
 downloads HTML, saves to disk.
 Output: data/html/{category}/*.html — raw HTML files, resumable.
@@ -7,40 +7,44 @@ Output: data/html/{category}/*.html — raw HTML files, resumable.
 import asyncio
 import json
 import os
+import random
+import time
 from pathlib import Path
 
-from curl_cffi import requests as curl
-
 import config
+from http_client import get as http_get
 from utils import ensure_dirs, safe_filename
+
+
+def fetch_sync(url):
+    """Fetch a URL. Runs in thread pool. Retries 403s (rate limits) with backoff."""
+    last = (0, 0, None)
+    for attempt in range(6):
+        try:
+            resp = http_get(url, timeout=45.0)
+            if resp is None:
+                time.sleep(1.5 + attempt)
+                continue
+            last = (resp.status_code, len(resp.content), resp.text)
+            if resp.status_code == 200 and len(resp.content) > 5000:
+                return last
+            if resp.status_code == 403:
+                time.sleep(2.5 + attempt * 2 + random.random() * 2)
+                continue
+            return last
+        except Exception:
+            time.sleep(1.5 + attempt)
+    return last
 
 
 async def fetch_url_async(url):
     try:
-        return await asyncio.to_thread(curl.get, url, impersonate="chrome", timeout=20.0)
-    except Exception as e:
-        return None
+        return await asyncio.to_thread(fetch_sync, url)
+    except Exception:
+        return 0, 0, None
 
 
-async def fetch_with_retry(url, max_retries=5):
-    """Fetch with exponential backoff, detect Cloudflare blocks."""
-    for attempt in range(max_retries):
-        resp = await fetch_url_async(url)
-        if resp is None:
-            await asyncio.sleep(1.5 ** attempt)
-            continue
-        # Detect Cloudflare block (short response with challenge)
-        if resp.status_code == 403 or (resp.status_code == 200 and len(resp.content) < 10000 and b'cloudflare' in resp.content.lower()):
-            await asyncio.sleep(5 * (2 ** attempt))  # much longer backoff for Cloudflare
-            continue
-        if resp.status_code in (403, 429, 503):
-            await asyncio.sleep(2.5 ** attempt)
-            continue
-        return resp
-    return None
-
-
-async def run_phase2(category, concurrency=30, start=None, end=None):
+async def run_phase2(category, concurrency=30, start=None, end=None, no_probe=False, limit=None):
     urls_file = f"data/urls/listing_urls_{category}.jsonl"
     if not os.path.exists(urls_file):
         print(f"[phase2] File not found: {urls_file}")
@@ -54,6 +58,10 @@ async def run_phase2(category, concurrency=30, start=None, end=None):
         items = items[start - 1:]
     if end is not None:
         items = items[:end - start + 1]
+    if limit is not None:
+        max_pages = (limit + config.PRODUCTS_PER_PAGE - 1) // config.PRODUCTS_PER_PAGE
+        items = items[:max_pages]
+        print(f"[phase2] [{category}] --limit {limit} → fetching at most {len(items)} listing pages")
 
     output_dir = f"data/html/{category}"
     ensure_dirs(output_dir)
@@ -71,16 +79,19 @@ async def run_phase2(category, concurrency=30, start=None, end=None):
         if not url.startswith('https://www.datasheets.com/category/'):
             skipped_malformed += 1
             continue
-        # Skip URLs with clearly malformed subcategory slugs (truncated at hyphen boundary)
+        # Skip URLs with malformed subcategory slugs (truncated at hyphen boundary)
         # e.g. "discrete-" (should be "discrete-semiconductors")
         try:
-            subcat_slug = url.split(f"/category/{category}/")[1].split("/")[0].split("?")[0]
+            # Split on /category/{category}/ — strip query string first to avoid ?page= breaking the split
+            url_path = url.split("?")[0]
+            after_cat = url_path.split(f"/category/{category}/")[1]
+            subcat_slug = after_cat.split("/")[0]
             if subcat_slug.endswith('-'):
                 skipped_malformed += 1
                 continue
-        except (IndexError, ValueError):
-            skipped_malformed += 1
-            continue
+        except IndexError:
+            # Root category URL (no subcategory) — valid, allow through
+            pass
         if safe_filename(url) not in existing:
             valid_items.append(it)
 
@@ -94,55 +105,57 @@ async def run_phase2(category, concurrency=30, start=None, end=None):
         print(f"[phase2] [{category}] Nothing to fetch.")
         return
 
-    # Group URLs by subcategory — subcategory is the first path segment after {category}/
-    # e.g. https://www.datasheets.com/category/semiconductors/discrete-semiconductors
-    # subcategory = "discrete-semiconductors"
+    # Group URLs by subcategory (root URLs go under key "")
     subcats: dict[str, list[dict]] = {}
     for it in valid_items:
         url = it["url"]
-        parts = url.split(f"/category/{category}/")[1].split("/")[0].split("?")[0]
-        subcats.setdefault(parts, []).append(it)
+        try:
+            url_path = url.split("?")[0]
+            after_cat = url_path.split(f"/category/{category}/")[1]
+            parts = after_cat.split("/")[0]
+            subcats.setdefault(parts, []).append(it)
+        except IndexError:
+            # Root category URL — group under empty string key
+            subcats.setdefault("", []).append(it)
 
-    print(f"[phase2] [{category}] {len(subcats)} subcategories to probe")
+    print(f"[phase2] [{category}] {len(subcats)} subcategories")
 
-    # Circuit breaker: probe each subcategory. Skip entire subcategory if probe fails.
-    # Probe uses the first URL in the subcategory.
     semaphore = asyncio.Semaphore(concurrency)
     skipped_subcats: set[str] = set()
 
-    async def probe_subcat(subcat, subcat_items):
-        async with semaphore:
-            probe_url = subcat_items[0]["url"]
-            resp = await fetch_with_retry(probe_url)
-            if resp is None or resp.status_code >= 500:
-                return subcat, False
-            return subcat, True
+    if not no_probe:
+        async def probe_subcat(subcat, subcat_items):
+            async with semaphore:
+                probe_url = subcat_items[0]["url"]
+                status, size, _ = await fetch_url_async(probe_url)
+                if status >= 500 or status == 0:
+                    return subcat, False
+                return subcat, True
 
-    # Run probes in waves to avoid triggering rate limits
-    subcat_list = list(subcats.items())
-    probed_ok = set()
-    wave_size = min(concurrency * 2, len(subcat_list))
+        subcat_list = list(subcats.items())
+        probed_ok = set()
+        wave_size = min(concurrency * 2, len(subcat_list))
 
-    for wave_start in range(0, len(subcat_list), wave_size):
-        wave = subcat_list[wave_start:wave_start + wave_size]
-        wave_results = await asyncio.gather(*[probe_subcat(sc, items) for sc, items in wave])
-        for subcat, ok in wave_results:
-            if ok:
-                probed_ok.add(subcat)
-            else:
-                skipped_subcats.add(subcat)
-                skipped_count = len(subcats[subcat])
-                print(f"[phase2] SKIP subcategory (blocked): {subcat} ({skipped_count} URLs)")
-        if wave_start + wave_size < len(subcat_list):
-            await asyncio.sleep(1.0)  # brief pause between probe waves
+        for wave_start in range(0, len(subcat_list), wave_size):
+            wave = subcat_list[wave_start:wave_start + wave_size]
+            wave_results = await asyncio.gather(*[probe_subcat(sc, items) for sc, items in wave])
+            for subcat, ok in wave_results:
+                if ok:
+                    probed_ok.add(subcat)
+                else:
+                    skipped_subcats.add(subcat)
+                    skipped_count = len(subcats[subcat])
+                    print(f"[phase2] SKIP subcategory (blocked): {subcat} ({skipped_count} URLs)")
+            if wave_start + wave_size < len(subcat_list):
+                await asyncio.sleep(0.5)
 
-    # Build final todo: only URLs from working subcategories
     todo = []
     for subcat, subcat_items in subcats.items():
         if subcat not in skipped_subcats:
             todo.extend(subcat_items)
 
-    print(f"[phase2] [{category}] Probing done. {len(todo)} URLs from {len(probed_ok)} subcategories | {len(skipped_subcats)} subcategories blocked")
+    probed_count = len([s for s in subcats if s not in skipped_subcats])
+    print(f"[phase2] [{category}] Probing done. {len(todo)} URLs from {probed_count} subcategories | {len(skipped_subcats)} subcategories blocked")
 
     if not todo:
         print(f"[phase2] [{category}] All subcategories blocked. Nothing to fetch.")
@@ -150,15 +163,13 @@ async def run_phase2(category, concurrency=30, start=None, end=None):
 
     async def fetch_one(item):
         async with semaphore:
-            resp = await fetch_with_retry(item["url"])
-            if resp is None:
-                return item["url"], None, "failed_after_retries"
-            if resp.status_code == 200 and len(resp.content) > 5000:
-                return item["url"], resp.text, None
-            return item["url"], None, f"status={resp.status_code} size={len(resp.content)}"
+            status, size, html = await fetch_url_async(item["url"])
+            if html and status == 200 and size > 5000:
+                return item["url"], html, None
+            return item["url"], None, f"status={status} size={size}"
 
     saved = errors = 0
-    batch_size = concurrency * 2
+    batch_size = concurrency * 4  # larger batches since requests are fast
 
     for i in range(0, len(todo), batch_size):
         batch = todo[i:i + batch_size]
@@ -182,7 +193,7 @@ async def run_phase2(category, concurrency=30, start=None, end=None):
               f"saved:{saved} err:{errors} ({i + len(batch)}/{len(todo)}, ~{elapsed:.0f}s)")
 
         if i + batch_size < len(todo):
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(0.3)  # small pause between batches
 
     total = len(list(Path(output_dir).glob("*.html")))
     print(f"[phase2] [{category}] Done — saved:{saved} err:{errors}, {total} files on disk")
@@ -195,8 +206,12 @@ async def main():
     parser.add_argument("--concurrency", default=10, type=int)
     parser.add_argument("--start", type=int, default=None, help="Start line number (1-indexed)")
     parser.add_argument("--end", type=int, default=None, help="End line number (1-indexed, inclusive)")
+    parser.add_argument("--no-probe", action="store_true", help="Skip subcategory probing")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Fetch only enough listing pages to cover N products")
     args = parser.parse_args()
-    await run_phase2(args.category, args.concurrency, args.start, args.end)
+    category = args.category.lower().strip()
+    await run_phase2(category, args.concurrency, args.start, args.end, args.no_probe, args.limit)
 
 
 if __name__ == "__main__":

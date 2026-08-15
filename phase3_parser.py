@@ -3,7 +3,11 @@ Phase 3: Parser — extracts products from saved HTML listing pages, outputs JSO
 NO PDF downloads — pdfUrl is constructed from the pattern.
 NO individual product page fetches — listing page data only.
 
-Output: data/output/{category}_products.jsonl (JSON Lines format, one product per line)
+Listing tables only expose Image / Part Number / Manufacturer / Description, so fields
+like price, quantity, leadTimeDays, countryOfOrigin, RoHS, etc. stay at schema defaults
+unless a future PDP (product detail) fetch is added.
+
+Output: data/output/{category}_products.json (JSON array)
 """
 import asyncio
 import json
@@ -83,40 +87,25 @@ def extract_products(html, category_path, breadcrumb):
 
 
 def build_record(prod):
-    """Build the final JSON record matching the target schema."""
+    """Build the final JSON record (target shape; commerce fields need PDP scrape)."""
     # category_path = test-measurement/inspection-equipment/calipers-micrometers/general
     # root = test-measurement, breadcrumb = [inspection-equipment, calipers-micrometers, general]
     category = [prod['category_path'].split('/')[0]] + prod['breadcrumb']
 
     return {
+        # Intermediate record — consumed by Phase 4 which overwrites with full schema.
+        # Fields here are used only as backfill when PDP HTML parse fails.
         'partNumber': prod['partNumber'],
         'productUrl': prod['productUrl'],
         'title': prod['title'],
-        'hasStoredDatasheet': False,
-        'pdfUrl': prod['pdfUrl'],
         'manufacturer': prod['manufacturer'],
         'category': category,
-        'site': 'datasheets.com',
-        'pdfHash': '',
-        'manufacturerMetadata': {
-            'description': prod['title'],
-            'general': {},
-            'compliance': [],
-            'images': [prod['imageUrl']] if prod['imageUrl'] else [],
-            'applications': [],
-        },
-        'pdfMetadata': {},
-        'countryOfOrigin': '',
-        'price': 0.0,
-        'quantity': 0,
-        'leadTimeDays': 0,
-        'isObsolete': False,
-        'obsoleteAt': '',
+        'pdfUrl': prod['pdfUrl'],
         'fetchedAt': now_utc(),
     }
 
 
-async def run_phase3(category):
+async def run_phase3(category, limit=None):
     html_dir = f'data/html/{category}'
     output_file = f'data/output/{category}_products.json'
     urls_file = f'data/urls/listing_urls_{category}.jsonl'
@@ -185,7 +174,7 @@ async def run_phase3(category):
         # Try exact URL match first, then fallback to category_path
         meta = url_meta.get(url) or by_cat_path.get(cat_path, {})
         breadcrumb = meta.get('breadcrumb', [])
-        category_path = meta.get('category_path', cat_path.replace('/', '-'))
+        category_path = meta.get('category_path', cat_path)
 
         products = extract_products(html, category_path, breadcrumb)
 
@@ -196,6 +185,12 @@ async def run_phase3(category):
             if key not in seen_keys:
                 seen_keys.add(key)
                 all_records.append(record)
+                if limit and len(all_records) >= limit:
+                    break
+
+        if limit and len(all_records) >= limit:
+            print(f'[phase3] [{category}] reached --limit {limit}; stopping parse')
+            break
 
         if len(all_records) % 500 == 0:
             print(f'[phase3] [{category}] {len(all_records)} unique products extracted')
@@ -205,10 +200,11 @@ async def run_phase3(category):
         json.dump(all_records, out, ensure_ascii=False, indent=2)
 
     # Clean up HTML files — no longer needed after parsing
-    import shutil
-    if os.path.exists(html_dir):
-        shutil.rmtree(html_dir)
-        print(f'[phase3] [{category}] Cleaned up {html_dir}')
+    # DISABLED: keeping HTML files
+    # import shutil
+    # if os.path.exists(html_dir):
+    #     shutil.rmtree(html_dir)
+    #     print(f'[phase3] [{category}] Cleaned up {html_dir}')
 
     print(f'[phase3] [{category}] Done — {len(all_records)} unique products → {output_file}')
     return len(all_records)
@@ -218,8 +214,10 @@ async def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--category', required=True)
+    parser.add_argument('--limit', type=int, default=None,
+                        help="Stop after N unique products")
     args = parser.parse_args()
-    await run_phase3(args.category)
+    await run_phase3(args.category.lower().strip(), args.limit)
 
 
 if __name__ == '__main__':

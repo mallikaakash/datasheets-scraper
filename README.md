@@ -1,88 +1,171 @@
 # Datasheets.com Scraper
 
-A 3-phase scraper for datasheets.com using `curl_cffi` (Chrome TLS impersonation) with `asyncio` concurrency.
+Scrapes electronic-component data from [datasheets.com](https://www.datasheets.com) —
+part numbers, specs, distributor pricing, and datasheet links — and writes one
+JSON record per product.
 
-## Setup
+
+
+It uses `curl_cffi` (Chrome TLS impersonation) + `asyncio` for fast, block-resistant
+fetching, and Playwright to clear the initial Cloudflare challenge once per session.
+
+---
+
+## 1. Setup (one time)
+
+**Requires Python 3.10+.**
 
 ```bash
+# 1. Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+# 2. Install dependencies
 pip install -r requirements.txt
+
+# 3. Install the Chromium build Playwright needs for the Cloudflare step
+playwright install chromium
 ```
 
-## 3-Phase Architecture
+> **Note:** Always run the scraper from the same environment where you installed
+> the dependencies. If you see `ModuleNotFoundError: No module named 'pypdf'`,
+> you're running a different Python (e.g. system/conda `base`) — re-activate the
+> venv.
 
-### Phase 1 — Generate Listing URLs (DFS category crawler)
+---
+
+## 2. Quick start
+
+Scrape one category, end to end. config.py file contains the parameter format and slug name
 
 ```bash
-python phase1_generator.py -c <category-slug>
+python main.py -c uncategorized
 ```
 
-Example:
-```bash
-python phase1_generator.py -c sensors-transducers
-python phase1_generator.py -c semiconductors
-```
-
-Output: `data/urls/listing_urls_<category>.jsonl`
-
-This crawls the category hierarchy using DFS, discovers all subcategories, and generates paginated listing URLs for every node (root → leaf). Each listing URL entry contains:
-
-- `url`: the full listing page URL
-- `breadcrumb`: the DFS path taken to reach this node
-- `total_products`: total products in this category
-- `category_path`: the full slash-separated path (e.g. `sensors-transducers/pressure-sensors/board-mount`)
-
-### Phase 2 — Download HTML
+Do a small test run first (caps the number of products):
 
 ```bash
-python phase2_fetcher.py -c <category> [options]
+python main.py -c uncategorized --limit 300
 ```
 
-Options:
-- `--concurrency N` — concurrent workers (default: 10, safe to run 2-3 instances in parallel)
-- `--start N` — start at URL index N (1-indexed)
-- `--end N` — end at URL index N (1-indexed)
+**First run only:** a Chrome window opens to pass Cloudflare. Leave it in front
+until the datasheets.com homepage appears (~90s). The session cookie is saved to
+`data/.cf_session.json` and reused, so later runs don't prompt again.
 
-For parallel execution across multiple terminals:
-```bash
-# Terminal 1: first half
-python phase2_fetcher.py -c sensors-transducers --start 1 --end 44000
+**Output:** `data/output/<category>_final.jsonl` — one JSON object per line.
 
-# Terminal 2: second half
-python phase2_fetcher.py -c sensors-transducers --start 44001 --end 88512
-```
+---
 
-Output: `data/html/<category>/*.html`
+## 3. What runs
 
-Resume-safe: already-downloaded files are skipped.
+`main.py` runs a 4-phase pipeline. By default **all four phases run**:
 
-### Phase 3 — Parse and Build JSON
+| Phase | Script | Does | Writes |
+|------:|--------|------|--------|
+| 1 | `phase1_generator.py` | Crawl category tree → paginated listing URLs | `data/urls/listing_urls_<cat>.jsonl` |
+| 2 | `phase2_fetcher.py` | Download listing-page HTML (resume-safe) | `data/html/<cat>/*.html` |
+| 3 | `phase3_parser.py` | Parse listings → product records, dedup | `data/output/<cat>_products.json` |
+| 4 | `phase4_pdp.py` | Visit each product page + pricing API → enriched records | `data/output/<cat>_final.jsonl` |
 
-```bash
-python phase3_parser.py -c <category>
-```
+**The `_final.jsonl` from Phase 4 is the deliverable.** Phases 1–3 build the input
+Phase 4 needs.
 
-Output: `data/output/<category>_products.json` (single JSON array)
+---
 
-Deduplicates by `(normalized_partNumber, manufacturer)`. Processes deepest category files first so products get assigned the most specific category. Deletes HTML files after parsing.
-
-## Workflow
-
-For a complete scrape:
+## 4. Common commands
 
 ```bash
-# 1. Generate URLs (do once per category)
-python phase1_generator.py -c <category>
+# Full pipeline for one category
+python main.py -c sensors-transducers
 
-# 2. Download HTML (run 2-3 terminals in parallel)
-python phase2_fetcher.py -c <category> --concurrency 10
+# Test run (cap products)
+python main.py -c sensors-transducers --limit 300
 
-# 3. Parse to JSON
-python phase3_parser.py -c <category>
+# Listing-level only — skip the slow per-product Phase 4
+python main.py -c sensors-transducers --no-pdp
+
+# Re-run Phase 4 only (reuses existing *_products.json)
+python main.py -c sensors-transducers --phase 4
+
+# Every category in config.py (long — can take a very long time)
+python main.py --all-categories --confirm-full-scrape
 ```
 
-## Notes
+**Resume behaviour:** if `data/output/<cat>_products.json` already exists, a normal
+run skips phases 1–3 and goes straight to Phase 4. To force a fresh listing crawl,
+delete that file first. Phase 2 is also resume-safe on its own (already-downloaded
+HTML is skipped).
 
-- Phase 2 may hit Cloudflare rate limits on specific subcategories (`envi`, `opti`, `spec`). The script handles retries with exponential backoff but some URLs may fail. Resume will skip already-downloaded files.
+Category slugs live in `config.py` (`CATEGORIES_TO_SCRAPE`), as do concurrency,
+delay, retry, and timeout knobs.
+
+---
+
+## 5. Pricing & currency — important
+
+This is the part most likely to surprise you, so read it before comparing output
+to the website.
+
+**Where prices come from.** For each product, Phase 4 calls the site's own pricing
+endpoint:
+
+```
+https://www.datasheets.com/api/part-pricing?pn=<partNumber>&manufacturer=<manufacturer>
+```
+
+Each distributor offer comes back in its **native currency** — e.g. GBP (Farnell),
+USD (Newark / Avnet), SGD (Element14) — with a list of quantity price-breaks.
+
+**We store prices exactly as that API returns them.** `unitPrice` and `currency`
+are the distributor's own numbers. **No currency conversion is performed** — we do
+not generate INR (or any other display currency). If you need a single currency,
+convert the native prices yourself with a rate and timestamp you control.
+
+> An earlier version converted everything to INR using a live FX API. That was
+> removed because (a) the values never matched the site's own INR picker — which
+> uses the site's own rate and timing — and (b) they were self-generated numbers,
+> not data the site actually gave us.
+
+**Why there can be more price-breaks than the website shows.** The visible price
+table on a product page often lists only a few tiers (e.g. `100 / 500 / 1000`). The
+pricing API frequently returns **more** tiers than the page renders (e.g.
+`250 / 2500 / 5000`, or a full `3000 → 48000` ladder). These extra tiers are
+**genuine distributor data** — the site's UI simply hides some of them — so we keep
+every real tier the API returns. This means the output may legitimately contain
+more price-breaks than you see on the page.
+
+**What we drop.** The API pads offers with dummy rows (quantity `0` and/or price
+`0.00000`). Those are filtered out, so an offer whose tiers are all zeros comes
+through with an empty `priceBreaks` list.
+
+See [PRICING.md](PRICING.md) for a fully worked example.
+
+---
+
+## 6. Output format
+
+`data/output/<category>_final.jsonl` — one product per line. Each record includes:
+identity (`partNumber`, `manufacturer`, `productUrl`, `productHeader`, `category`),
+`availability`, `technicalSpecification` (description, general specs, compliance,
+images), `pricing` (per-distributor offers with native-currency `priceBreaks`),
+`datasheet` metadata, and an `audit` block.
+
+---
+
+## 7. Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `ModuleNotFoundError: pypdf` (or others) | Wrong Python — activate the venv where you ran `pip install`. |
+| Playwright / "Executable doesn't exist" | Run `playwright install chromium`. |
+| Cloudflare window keeps reopening | Let the homepage fully load and stay in front; delete `data/.cf_session.json` to reset the session. |
+| Some subcategories fail in Phase 2 | Cloudflare rate-limits a few subtrees; retries with backoff are built in, and resume skips what's already downloaded — just re-run. |
+| Want to re-fetch fresh data | Phase 4 is resume-safe (it skips products already in `_final.jsonl`). To regenerate from scratch, delete `data/output/<cat>_final.jsonl` (and `<cat>_products.json` / `data/html/<cat>/` to also redo phases 1–3). |
+
+---
+
+## 8. Notes
+
 - `pdfUrl` is constructed from manufacturer + part number, not scraped.
-- `pdfHash` and `manufacturerMetadata` fields are empty placeholders.
-- Phase 3 cleans up HTML files automatically after parsing.
+- Phase 3 deletes each category's HTML after parsing to save disk.
+- Data output lives under `data/` and is gitignored.

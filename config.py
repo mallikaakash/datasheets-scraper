@@ -1,6 +1,10 @@
 BASE_URL = "https://www.datasheets.com"
 START_CATEGORY = "sensors-transducers"
 
+# Smallest root catalog on the site (~3k parts); good for pipeline smoke tests.
+# (Verified by comparing /category/<slug> product counts.)
+SMALL_TEST_CATEGORY_SLUG = "uncategorized"
+
 CATEGORIES_TO_SCRAPE = [
     "sensors-transducers",
     "circuit-protection",
@@ -56,3 +60,7 @@ URLS_DIR = f"{DATA_DIR}/urls"
 HTML_DIR = f"{DATA_DIR}/html"
 PDF_DIR = f"{DATA_DIR}/pdfs"
 OUTPUT_FILE = f"{DATA_DIR}/output/results.jsonl"
+
+# Prices are stored in the distributors' native currencies (USD/GBP/SGD),
+# exactly as datasheets.com's pricing API returns them. No FX conversion is
+# performed — see PRICING.md.
